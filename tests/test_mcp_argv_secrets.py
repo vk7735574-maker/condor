@@ -2,13 +2,18 @@
 
 ``ps -eo args`` is world-readable, so anything on a child's command line is
 readable by every local process. These tests pin the two halves of the fix: the
-spawner puts credentials on the ``env`` channel only, and the startup reaper —
+spawner puts credentials in a 0600 file and only its path in the spawn config
+(whose ``env`` the ACP bridge also puts on argv), and the startup reaper —
 which used to find our subprocess trees by grepping ``ps`` for the bot token —
 still finds them through the non-secret marker that replaced it.
 """
 
+import json
+import os
+import stat
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -71,18 +76,140 @@ def test_no_secret_appears_anywhere_in_argv(session_servers):
             assert flag not in server["args"]
 
 
-def test_secrets_travel_on_the_env_channel_instead(session_servers):
+def _secrets_of(server: dict) -> dict[str, str]:
+    return json.loads(Path(_env_of(server)["CONDOR_MCP_SECRETS_FILE"]).read_text())
+
+
+def test_no_secret_appears_anywhere_in_the_spawn_config(session_servers):
+    """Not in ``env`` either: the ACP bridge hands the whole config — ``env``
+    included — to the ``claude`` CLI as ``--mcp-config '<json>'``, so anything
+    in it is on a command line that ``ps`` shows every local user."""
+    blob = repr(session_servers)
+    for secret in (BOT_TOKEN, API_PASSWORD, API_USER):
+        assert secret not in blob, f"a secret is in the spawn config: {blob}"
+
+
+def test_secrets_travel_in_a_file_only_we_can_read(session_servers):
     condor = next(s for s in session_servers if s["name"] == "condor")
     hummingbot = next(s for s in session_servers if s["name"] == "mcp-hummingbot")
 
-    assert _env_of(condor)["TELEGRAM_BOT_TOKEN"] == BOT_TOKEN
-    assert _env_of(hummingbot)["HUMMINGBOT_API_USERNAME"] == API_USER
-    assert _env_of(hummingbot)["HUMMINGBOT_API_PASSWORD"] == API_PASSWORD
+    assert _secrets_of(condor) == {"TELEGRAM_BOT_TOKEN": BOT_TOKEN}
+    assert _secrets_of(hummingbot) == {
+        "HUMMINGBOT_API_USERNAME": API_USER,
+        "HUMMINGBOT_API_PASSWORD": API_PASSWORD,
+    }
+    for server in (condor, hummingbot):
+        path = Path(_env_of(server)["CONDOR_MCP_SECRETS_FILE"])
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
 
     # Non-secret coordinates stay on argv, where they identify a live process.
     assert "--url" in hummingbot["args"]
     assert "http://10.0.0.5:8000" in hummingbot["args"]
     assert hummingbot["args"][hummingbot["args"].index("--server-name") + 1] == "prod"
+
+
+def test_secrets_file_is_rewritten_when_a_credential_changes(tmp_path):
+    from condor.runtime import toolsets
+
+    first = toolsets._secrets_file("srv", HUMMINGBOT_API_PASSWORD="old")
+    second = toolsets._secrets_file("srv", HUMMINGBOT_API_PASSWORD="new")
+
+    assert first == second
+    assert json.loads(Path(second).read_text()) == {"HUMMINGBOT_API_PASSWORD": "new"}
+    assert not [p for p in Path(second).parent.iterdir() if p.suffix == ".tmp"]
+
+
+def test_no_secrets_file_without_a_secret():
+    from condor.runtime import toolsets
+
+    assert toolsets._secrets_file("empty", TELEGRAM_BOT_TOKEN="") is None
+    assert toolsets._secrets_file("empty", TELEGRAM_BOT_TOKEN=None) is None
+
+
+def test_server_secrets_stem_cannot_escape_the_directory():
+    from condor.runtime import toolsets
+
+    stem = toolsets._server_secrets_stem("../../etc/passwd")
+    assert "/" not in stem and ".." not in stem
+    assert stem != toolsets._server_secrets_stem("__/__/etc/passwd")
+
+
+# ── the subprocess side: load_secrets_file ──
+
+
+def _write(path: Path, data, mode=0o600) -> Path:
+    path.write_text(json.dumps(data))
+    path.chmod(mode)
+    return path
+
+
+def test_loader_puts_allowed_secrets_in_the_env(tmp_path, monkeypatch):
+    from mcp_servers._secrets_file import load_secrets_file
+
+    path = _write(
+        tmp_path / "s.json",
+        {"HUMMINGBOT_API_PASSWORD": API_PASSWORD, "LD_PRELOAD": "/evil.so"},
+    )
+    monkeypatch.setenv("CONDOR_MCP_SECRETS_FILE", str(path))
+    monkeypatch.delenv("HUMMINGBOT_API_PASSWORD", raising=False)
+    monkeypatch.delenv("LD_PRELOAD", raising=False)
+
+    load_secrets_file()
+
+    assert os.environ["HUMMINGBOT_API_PASSWORD"] == API_PASSWORD
+    assert "LD_PRELOAD" not in os.environ
+
+
+def test_loader_refuses_a_file_others_can_read(tmp_path, monkeypatch):
+    from mcp_servers._secrets_file import load_secrets_file
+
+    path = _write(tmp_path / "s.json", {"TELEGRAM_BOT_TOKEN": BOT_TOKEN}, 0o644)
+    monkeypatch.setenv("CONDOR_MCP_SECRETS_FILE", str(path))
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+
+    load_secrets_file()
+
+    assert "TELEGRAM_BOT_TOKEN" not in os.environ
+
+
+def test_loader_refuses_a_symlink(tmp_path, monkeypatch):
+    from mcp_servers._secrets_file import load_secrets_file
+
+    real = _write(tmp_path / "real.json", {"TELEGRAM_BOT_TOKEN": BOT_TOKEN})
+    link = tmp_path / "link.json"
+    link.symlink_to(real)
+    monkeypatch.setenv("CONDOR_MCP_SECRETS_FILE", str(link))
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+
+    load_secrets_file()
+
+    assert "TELEGRAM_BOT_TOKEN" not in os.environ
+
+
+def test_loader_is_a_no_op_without_the_variable(monkeypatch):
+    from mcp_servers._secrets_file import load_secrets_file
+
+    monkeypatch.delenv("CONDOR_MCP_SECRETS_FILE", raising=False)
+    before = dict(os.environ)
+    load_secrets_file()
+    assert dict(os.environ) == before
+
+
+def test_spawned_servers_load_the_file_before_their_settings(session_servers):
+    """End to end through the real entry points' first step: what the spawner
+    wrote is what the child's settings end up reading."""
+    hummingbot = next(s for s in session_servers if s["name"] == "mcp-hummingbot")
+    env = {**os.environ, **_env_of(hummingbot)}
+    env.pop("HUMMINGBOT_API_PASSWORD", None)
+    code = (
+        "import os; from mcp_servers._secrets_file import load_secrets_file; "
+        "load_secrets_file(); print(os.environ['HUMMINGBOT_API_PASSWORD'])"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True
+    )
+    assert out.stdout.strip() == API_PASSWORD, out.stderr
 
 
 def test_both_servers_carry_the_reaper_marker(session_servers):

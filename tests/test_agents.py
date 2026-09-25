@@ -863,7 +863,11 @@ def test_numeric_credentials_reach_the_subprocess_as_strings(monkeypatch):
             assert isinstance(entry["name"], str)
             assert isinstance(entry["value"], str), f"{server['name']}/{entry['name']}"
 
+    import json
+    from pathlib import Path
+
     hb = next(s for s in servers if s["name"] == "mcp-hummingbot")
     env = {e["name"]: e["value"] for e in hb["env"]}
-    assert env["HUMMINGBOT_API_USERNAME"] == "999"
-    assert env["HUMMINGBOT_API_PASSWORD"] == "123"
+    secrets = json.loads(Path(env["CONDOR_MCP_SECRETS_FILE"]).read_text())
+    assert secrets["HUMMINGBOT_API_USERNAME"] == "999"
+    assert secrets["HUMMINGBOT_API_PASSWORD"] == "123"

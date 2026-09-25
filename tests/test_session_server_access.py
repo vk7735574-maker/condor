@@ -19,6 +19,8 @@ a member who *can* reach that server still resolves it.
 """
 
 import asyncio
+import json
+from pathlib import Path
 
 import pytest
 
@@ -117,12 +119,20 @@ def _hummingbot(servers):
 
 
 def _env_of(server):
-    return {e["name"]: e["value"] for e in server.get("env", [])}
+    """The subprocess's env as it will see it: secrets file included."""
+    env = {e["name"]: e["value"] for e in server.get("env", [])}
+    if path := env.get("CONDOR_MCP_SECRETS_FILE"):
+        env.update(json.loads(Path(path).read_text()))
+    return env
 
 
 def _leaks_victim(servers) -> bool:
-    """True if the victim's credentials reached the spawn config, anywhere."""
-    blob = repr(servers)
+    """True if the victim's credentials reached the spawn, anywhere.
+
+    Secrets travel in a file the config only points at, so the files each
+    server is handed are part of what it was given.
+    """
+    blob = repr(servers) + repr([_env_of(s) for s in servers])
     return any(
         SERVERS[VICTIM_SERVER][field] in blob for field in ("username", "password")
     )

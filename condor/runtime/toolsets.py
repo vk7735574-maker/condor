@@ -9,6 +9,7 @@ via lazy imports; ``handlers`` now re-exports from here instead.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from collections.abc import Sequence
@@ -55,13 +56,80 @@ def _bot_id_args() -> list[str]:
     return ["--bot-id", marker] if marker else []
 
 
+def _secrets_file(stem: str, **values: Any) -> str | None:
+    """Write ``values`` to a 0600 file and return its path; None if all empty.
+
+    Secrets must not travel in the spawn config at all — not even its ``env``
+    channel: the ACP bridge passes the whole config to the ``claude`` CLI as
+    ``--mcp-config '<json>'``, which puts every value back on a command line any
+    local user can read through ``ps``. Only this file's path goes in the config
+    (as ``CONDOR_MCP_SECRETS_FILE``); the subprocess reads the values back with
+    :func:`mcp_servers._secrets_file.load_secrets_file`.
+
+    One file per ``stem`` (a server, the bot), not per session: spawns are
+    frequent and a session's MCP children may be restarted by the bridge long
+    after the spawn, so the file has to outlive it. It holds nothing
+    ``config.yml`` does not already hold. Rewritten atomically only when the
+    content changes, so a rotated password reaches the next spawn.
+    """
+    import json
+    import stat
+    import tempfile
+
+    from condor.paths import runtime_root
+
+    secrets = {k: str(v) for k, v in values.items() if v is not None and str(v)}
+    if not secrets:
+        return None
+
+    directory = runtime_root() / "secrets"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    path = directory / f"{stem}.json"
+    payload = json.dumps(secrets, sort_keys=True)
+
+    try:
+        if (
+            stat.S_IMODE(path.lstat().st_mode) == 0o600
+            and path.read_text(encoding="utf-8") == payload
+        ):
+            return str(path)
+    except OSError:
+        pass
+
+    # mkstemp creates the file 0600, so the secret is never briefly readable.
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=f".{stem}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return str(path)
+
+
+def _server_secrets_stem(server_name: str) -> str:
+    """A file stem for a server's credentials that no server name can escape.
+
+    Server names are user-chosen; the readable part is squashed to a safe
+    charset and the digest keeps two names that squash alike apart.
+    """
+    import hashlib
+    import re
+
+    readable = re.sub(r"[^A-Za-z0-9_-]", "_", server_name)[:40]
+    digest = hashlib.sha256(server_name.encode()).hexdigest()[:12]
+    return f"hummingbot-{readable}-{digest}"
+
+
 def _env_entries(**values: Any) -> list[dict[str, str]]:
     """ACP ``env`` entries (``{"name", "value"}``), skipping empty values.
 
-    This is the channel every secret an MCP subprocess needs must travel on: the
-    ACP bridge and the pydantic-ai stdio client both overlay these onto the
-    child's inherited environment, which — unlike argv — no other local user can
-    read out of ``ps``.
+    Never a secret: the ACP bridge puts these on the ``claude`` CLI's command
+    line (``--mcp-config``). Secrets go through :func:`_secrets_file`, and only
+    its path travels here.
 
     Values are coerced to ``str``: YAML loads an unquoted numeric credential as
     int (e.g. ``password: 123``), and an int in the environment mapping breaks
@@ -441,7 +509,9 @@ def build_mcp_servers_for_session(
         # one from ``$CONDOR_RUNTIME_ROOT``. Passing the answer removes the
         # derivation from the child's problem entirely.
         "env": _env_entries(
-            TELEGRAM_BOT_TOKEN=_bot_token(),
+            CONDOR_MCP_SECRETS_FILE=_secrets_file(
+                "telegram", TELEGRAM_BOT_TOKEN=_bot_token()
+            ),
             CONDOR_AGENTS_ROOT=str(local_agents_root()),
             CONDOR_STOCK_AGENTS_ROOT=str(stock_agents_root()),
         ),
@@ -466,17 +536,21 @@ def build_mcp_servers_for_session(
         )
         return [condor]
 
-    # Credentials go in env, not argv: the API username/password used to sit on
-    # the command line, where any local `ps` recovered them (SEC-095). The
-    # non-secret coordinates (url, server name) stay on argv, where they make a
-    # running subprocess identifiable.
+    # Credentials go in a 0600 file, not argv or env: the API username/password
+    # used to sit on the command line, where any local `ps` recovered them
+    # (SEC-095), and the ACP bridge puts ``env`` there too. The non-secret
+    # coordinates (url, server name) stay on argv, where they make a running
+    # subprocess identifiable.
     mcp_hummingbot = {
         "name": "mcp-hummingbot",
         "command": "uv",
         "args": _hummingbot_mcp_args(server, server_name, profile, muted_tools),
         "env": _env_entries(
-            HUMMINGBOT_API_USERNAME=server["username"],
-            HUMMINGBOT_API_PASSWORD=server["password"],
+            CONDOR_MCP_SECRETS_FILE=_secrets_file(
+                _server_secrets_stem(server_name),
+                HUMMINGBOT_API_USERNAME=server["username"],
+                HUMMINGBOT_API_PASSWORD=server["password"],
+            ),
         ),
     }
 
