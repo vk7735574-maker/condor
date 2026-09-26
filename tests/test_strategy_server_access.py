@@ -30,7 +30,7 @@ PNL = 7.0
 
 
 class _FakeCM:
-    """Just the four ConfigManager methods this path touches."""
+    """Just the ConfigManager methods this path touches."""
 
     def __init__(self, servers=(SERVER,), access=((OWNER, SERVER),)):
         self.servers = set(servers)
@@ -40,6 +40,9 @@ class _FakeCM:
 
     def is_admin(self, user_id: int) -> bool:
         return user_id == ADMIN
+
+    def get_user(self, user_id: int):
+        return {"role": "user"} if user_id in (ADMIN, OWNER, STRANGER) else None
 
     def get_server(self, name: str):
         return {"name": name} if name in self.servers else None
@@ -187,6 +190,18 @@ def test_a_strategy_with_no_recorded_creator_falls_back_to_the_caller(cm, strate
     strategy.created_by = 0
     assert agents_routes._strategy_principal(strategy, _user(ADMIN)) == ADMIN
     assert agents_routes._strategy_principal(strategy, _user(STRANGER)) == STRANGER
+
+
+def test_a_creator_unknown_to_this_install_falls_back_to_the_caller(cm, strategy):
+    """The shipped library's ``created_by`` is an upstream author's id: there is
+    no such user here to hold an admin to, so the admin is checked as themselves."""
+    strategy.created_by = 999_999
+    assert agents_routes._strategy_principal(strategy, _user(ADMIN)) == ADMIN
+    assert agents_routes._strategy_principal(strategy, _user(STRANGER)) == STRANGER
+    client, _ = asyncio.run(
+        agents_routes._get_client_for_strategy(strategy.home, None, ADMIN)
+    )
+    assert client is cm.client
 
 
 def test_a_non_admin_is_always_checked_as_themselves(cm, strategy):

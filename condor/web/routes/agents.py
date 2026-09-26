@@ -891,11 +891,19 @@ def _strategy_principal(strategy, user: WebUser) -> int:
     strategy has been cut off from it. A strategy with no recorded creator
     (``created_by == 0``: everything written before the field existed) has no
     subject to stand in, so the caller remains the principal.
+
+    Nor does a creator who was never a user of *this* install: the shipped
+    library under ``agents/`` carries the Telegram ids of whoever wrote it
+    upstream. Holding an admin to such an id refused every shipped strategy's
+    server — pricing none of them, and logging a warning on every dashboard
+    poll. User records are never deleted (a cut-off user is blocked, keeping
+    the record), so this cannot free an admin from a real creator's reach.
     """
     from config_manager import get_config_manager
 
+    cm = get_config_manager()
     creator = int(getattr(strategy, "created_by", 0) or 0)
-    if creator and get_config_manager().is_admin(user.id):
+    if creator and cm.is_admin(user.id) and cm.get_user(creator) is not None:
         return creator
     return user.id
 
